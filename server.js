@@ -58,34 +58,64 @@ app.get("/api/search", async (req, res) => {
 });
 
 // extract timestamps
-app.get("/api/timestamps", async (req, res) => {
+app.get("/api/search", async (req, res) => {
   try {
-    const pageUrl = req.query.url;
-    if (!pageUrl) return res.json([]);
+    const query = (req.query.q || "").trim();
+    if (!query) return res.json([]);
 
-    const { data } = await axios.get(pageUrl, {
-      headers: {
-        "User-Agent": "Mozilla/5.0",
-      },
+    // 1) Prefer Where’sTheJump built-in search
+    const wtjSearchUrl = `https://wheresthejump.com/?s=${encodeURIComponent(query)}`;
+
+    const wtjResp = await axios.get(wtjSearchUrl, {
+      headers: { "User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9" },
+      timeout: 15000,
     });
 
-    const $ = cheerio.load(data);
+    let $ = cheerio.load(wtjResp.data);
 
-    const bodyText = $("body").text();
-
-    // match HH:MM:SS
-    const matches = bodyText.match(/\b\d{2}:\d{2}:\d{2}\b/g) || [];
-
-    // dedupe + sort
-    const unique = [...new Set(matches)].sort();
-
-    res.json({
-      count: unique.length,
-      timestamps: unique,
+    // WP search results: grab links that look like jump-scare pages
+    let results = [];
+    $("a").each((_, el) => {
+      const title = ($(el).text() || "").trim();
+      const url = $(el).attr("href") || "";
+      if (
+        url.includes("wheresthejump.com/jump-scares") &&
+        !results.some(r => r.url === url)
+      ) {
+        results.push({ title: title || url, url });
+      }
     });
+
+    // Limit to 8
+    results = results.slice(0, 8);
+    if (results.length > 0) return res.json(results);
+
+    // 2) Fallback: DuckDuckGo HTML (sometimes works, sometimes not)
+    const ddgUrl = `https://html.duckduckgo.com/html/?q=site:wheresthejump.com%20${encodeURIComponent(
+      query
+    )}%20jump%20scares`;
+
+    const ddgResp = await axios.get(ddgUrl, {
+      headers: { "User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9" },
+      timeout: 15000,
+    });
+
+    $ = cheerio.load(ddgResp.data);
+
+    const ddgResults = [];
+    $("a.result__a, a[data-testid='result-title-a']").each((i, el) => {
+      if (i >= 8) return false;
+      const title = $(el).text().trim();
+      const url = $(el).attr("href");
+      if (url && url.includes("wheresthejump.com/jump-scares")) {
+        ddgResults.push({ title, url });
+      }
+    });
+
+    return res.json(ddgResults);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "failed to extract timestamps" });
+    console.error("SEARCH ERROR:", err?.message || err);
+    return res.status(500).json({ error: "search failed" });
   }
 });
 
