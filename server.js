@@ -103,7 +103,7 @@ function extractNotScareTimestampsFromText(text) {
   return out;
 }
 
-app.get("/api/health", (_req, res) => res.json({ status: "ok" }));
+app.get("/api/health", (_req, res) => res.json({ status: "ok", source: "notscare" }));
 
 // --- SEARCH ---
 // Keeps same response shape as before: [{ title, url }]
