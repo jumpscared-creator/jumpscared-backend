@@ -79,7 +79,10 @@ app.get("/api/health", (_req, res) => {
 });
 
 // ---- Search ----
-// Returns: [{ title, url }]
+// Robust approach:
+// - Extract ALL <a href> links
+// - Keep only /jump-scares-in- pages
+// - Generate title from slug (doesn’t rely on page markup / anchor text)
 app.get("/api/search", async (req, res) => {
   try {
     const q = normalizeSpaces(req.query.q);
@@ -87,8 +90,8 @@ app.get("/api/search", async (req, res) => {
       return res.status(400).json({ error: "Missing or too-short query `q`." });
     }
 
-    const url = `${WTJ_BASE}/?s=${encodeURIComponent(q)}`;
-    const fetched = await fetchHtml(url);
+    const searchUrl = `${WTJ_BASE}/?s=${encodeURIComponent(q)}`;
+    const fetched = await fetchHtml(searchUrl);
     if (!fetched.ok) {
       return res.status(502).json({ error: `WTJ search failed: ${fetched.status}` });
     }
@@ -98,39 +101,30 @@ app.get("/api/search", async (req, res) => {
     const results = [];
     const seen = new Set();
 
-    // WTJ markup varies, so try multiple selectors then fall back to all links.
-    const selectors = [
-      "article .entry-title a",
-      "h2.entry-title a",
-      "h3.entry-title a",
-      ".entry-title a",
-      "article a",
-      "a",
-    ];
+    $("a[href]").each((_, el) => {
+      const href = $(el).attr("href");
+      if (!href) return;
 
-    for (const sel of selectors) {
-      $(sel).each((_, el) => {
-        const href = $(el).attr("href");
-        const title = normalizeSpaces($(el).text());
-        if (!href || !title) return;
+      const full = href.startsWith("http") ? href : WTJ_BASE + href;
 
-        const full = href.startsWith("http") ? href : WTJ_BASE + href;
+      if (!full.includes("/jump-scares-in-")) return;
+      if (!isValidWtjUrl(full)) return;
 
-        // Keep only actual movie pages
-        if (!full.includes("/jump-scares-in-")) return;
-        if (!isValidWtjUrl(full)) return;
+      // junk filters
+      if (full.includes("/tag/") || full.includes("/category/") || full.includes("/?s=")) return;
 
-        // Remove obvious junk
-        if (full.includes("/tag/") || full.includes("/category/") || full.includes("/?s=")) return;
+      if (seen.has(full)) return;
+      seen.add(full);
 
-        if (!seen.has(full)) {
-          seen.add(full);
-          results.push({ title, url: full });
-        }
-      });
+      // title from slug
+      const slug = full.split("/").filter(Boolean).pop() || "";
+      const clean = slug
+        .replace(/^jump-scares-in-/, "")
+        .replace(/-/g, " ")
+        .replace(/\b\w/g, (c) => c.toUpperCase());
 
-      if (results.length >= 10) break;
-    }
+      results.push({ title: clean, url: full });
+    });
 
     res.json(results.slice(0, 10));
   } catch (e) {
