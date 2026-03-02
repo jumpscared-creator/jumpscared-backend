@@ -30,21 +30,37 @@ function isValidWtjUrl(url) {
   }
 }
 
+// Detect common “bot/verification” HTML.
+// (We’re not trying to bypass anything — just detect and report clearly.)
+function looksLikeBlockedHtml(html) {
+  const h = (html || "").toLowerCase();
+  return (
+    h.includes("checking your browser") ||
+    h.includes("verify you are human") ||
+    h.includes("please enable javascript") ||
+    h.includes("cloudflare") ||
+    h.includes("attention required") ||
+    h.includes("access denied")
+  );
+}
+
 async function fetchHtml(url) {
   const { controller, clear } = withTimeout(FETCH_TIMEOUT_MS);
   try {
     const resp = await fetch(url, {
       signal: controller.signal,
+      // Node fetch follows redirects by default, which is good for /?p= links
       headers: {
         "User-Agent": UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache"
-      }
+        "Cache-Control": "no-cache",
+      },
     });
 
-    if (!resp.ok) return { ok: false, status: resp.status, html: "" };
-    return { ok: true, status: resp.status, html: await resp.text() };
+    const html = await resp.text().catch(() => "");
+    if (!resp.ok) return { ok: false, status: resp.status, html };
+    return { ok: true, status: resp.status, html };
   } finally {
     clear();
   }
@@ -54,15 +70,20 @@ function normalizeToHHMMSS(raw) {
   const parts = String(raw).trim().split(":");
   if (parts.length !== 2 && parts.length !== 3) return null;
 
-  let hh = 0, mm = 0, ss = 0;
+  let hh = 0,
+    mm = 0,
+    ss = 0;
   if (parts.length === 2) {
-    mm = Number(parts[0]); ss = Number(parts[1]);
+    mm = Number(parts[0]);
+    ss = Number(parts[1]);
   } else {
-    hh = Number(parts[0]); mm = Number(parts[1]); ss = Number(parts[2]);
+    hh = Number(parts[0]);
+    mm = Number(parts[1]);
+    ss = Number(parts[2]);
   }
-  if ([hh,mm,ss].some(Number.isNaN) || mm > 59 || ss > 59 || hh > 99) return null;
+  if ([hh, mm, ss].some(Number.isNaN) || mm > 59 || ss > 59 || hh > 99) return null;
 
-  return `${String(hh).padStart(2,"0")}:${String(mm).padStart(2,"0")}:${String(ss).padStart(2,"0")}`;
+  return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
 }
 
 app.get("/api/health", (_req, res) => res.json({ status: "ok" }));
@@ -76,12 +97,26 @@ app.get("/api/search", async (req, res) => {
     const fetched = await fetchHtml(url);
     if (!fetched.ok) return res.status(502).json({ error: `WTJ search failed: ${fetched.status}` });
 
+    // ✅ Log a preview so we can confirm what WTJ is returning
+    console.log("----- WTJ SEARCH HTML PREVIEW -----");
+    console.log(fetched.html.substring(0, 600));
+    console.log("----- END PREVIEW -----");
+
+    // ✅ If WTJ is returning a verification page, return a clear signal (not [])
+    if (looksLikeBlockedHtml(fetched.html)) {
+      return res.status(503).json({
+        error: "SOURCE_BLOCKED",
+        message: "Where’s The Jump appears to be blocking automated requests right now. Use manual entry.",
+      });
+    }
+
     const $ = cheerio.load(fetched.html);
 
     const results = [];
     const seen = new Set();
 
     const selectors = ["article .entry-title a", "h2.entry-title a", "h3.entry-title a", ".entry-title a", "article a"];
+
     for (const sel of selectors) {
       $(sel).each((_, el) => {
         const href = $(el).attr("href");
@@ -89,27 +124,29 @@ app.get("/api/search", async (req, res) => {
         if (!href || !title) return;
 
         const full = href.startsWith("http") ? href : WTJ_BASE + href;
-       if (!full.includes("/jump-scares-in-")) return;
-if (!isValidWtjUrl(full)) return;
+        if (!isValidWtjUrl(full)) return;
 
-if (
-  full.includes("/tag/") ||
-  full.includes("/category/") ||
-  full.includes("/?s=")
-) return;
+        // Keep out taxonomy + search pages
+        if (full.includes("/tag/") || full.includes("/category/") || full.includes("/?s=")) return;
 
+        // ✅ Accept both the canonical pattern AND WP post links that redirect to it
+        const isJumpScarePost = full.includes("/jump-scares-in-") || full.includes("/?p=");
+        if (!isJumpScarePost) return;
 
         if (!seen.has(full)) {
           seen.add(full);
           results.push({ title, url: full });
         }
       });
+
       if (results.length >= 10) break;
     }
 
     res.json(results.slice(0, 10));
   } catch (e) {
-    res.status(500).json({ error: e?.name === "AbortError" ? "WTJ search timed out." : "Server error during search." });
+    res.status(500).json({
+      error: e?.name === "AbortError" ? "WTJ search timed out." : "Server error during search.",
+    });
   }
 });
 
@@ -120,6 +157,14 @@ app.get("/api/timestamps", async (req, res) => {
 
     const fetched = await fetchHtml(url);
     if (!fetched.ok) return res.status(502).json({ error: `WTJ page failed: ${fetched.status}` });
+
+    // ✅ Detect block pages here too
+    if (looksLikeBlockedHtml(fetched.html)) {
+      return res.status(503).json({
+        error: "SOURCE_BLOCKED",
+        message: "Where’s The Jump appears to be blocking automated requests right now. Use manual entry.",
+      });
+    }
 
     const $ = cheerio.load(fetched.html);
     const title = normalizeSpaces($("h1.entry-title").first().text()) || normalizeSpaces($("title").text());
@@ -139,7 +184,9 @@ app.get("/api/timestamps", async (req, res) => {
 
     res.json({ url, title, timestamps: out });
   } catch (e) {
-    res.status(500).json({ error: e?.name === "AbortError" ? "WTJ timestamps timed out." : "Server error during timestamps." });
+    res.status(500).json({
+      error: e?.name === "AbortError" ? "WTJ timestamps timed out." : "Server error during timestamps.",
+    });
   }
 });
 
